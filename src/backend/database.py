@@ -1,15 +1,142 @@
 """
-MongoDB database configuration and setup for Mergington High School API
+In-memory database configuration and setup for Mergington High School API
 """
 
-from pymongo import MongoClient
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
+from typing import Dict, Any, List, Optional
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+# In-memory database implementation
+class InMemoryCollection:
+    """Simple in-memory collection that mimics MongoDB collection interface"""
+    
+    def __init__(self):
+        self.data: Dict[str, Dict[str, Any]] = {}
+    
+    def count_documents(self, query: Dict[str, Any]) -> int:
+        """Count documents matching query"""
+        if not query:
+            return len(self.data)
+        return len([doc for doc in self.data.values() if self._matches_query(doc, query)])
+    
+    def insert_one(self, document: Dict[str, Any]) -> None:
+        """Insert a single document"""
+        doc_id = document.get('_id')
+        if doc_id is None:
+            raise ValueError("Document must have an _id field")
+        self.data[str(doc_id)] = document.copy()
+    
+    def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Find a single document matching query"""
+        for doc in self.data.values():
+            if self._matches_query(doc, query):
+                return doc.copy()
+        return None
+    
+    def find(self, query: Dict[str, Any]):
+        """Find all documents matching query"""
+        results = []
+        for doc in self.data.values():
+            if self._matches_query(doc, query):
+                results.append(doc.copy())
+        return results
+    
+    def update_one(self, query: Dict[str, Any], update: Dict[str, Any]):
+        """Update a single document"""
+        for doc_id, doc in self.data.items():
+            if self._matches_query(doc, query):
+                if '$push' in update:
+                    for field, value in update['$push'].items():
+                        if field in doc and isinstance(doc[field], list):
+                            doc[field].append(value)
+                elif '$set' in update:
+                    for field, value in update['$set'].items():
+                        doc[field] = value
+                return type('UpdateResult', (), {'modified_count': 1})()
+        return type('UpdateResult', (), {'modified_count': 0})()
+    
+    def aggregate(self, pipeline: List[Dict[str, Any]]):
+        """Simple aggregation pipeline support"""
+        results = []
+        for stage in pipeline:
+            if '$unwind' in stage:
+                field = stage['$unwind'].replace('$', '')
+                unwound = []
+                for doc in (results if results else self.data.values()):
+                    field_parts = field.split('.')
+                    value = doc
+                    for part in field_parts:
+                        value = value.get(part, [])
+                    if isinstance(value, list):
+                        for item in value:
+                            unwound.append({**doc, field: item})
+                results = unwound
+            elif '$group' in stage:
+                grouped = {}
+                group_by = stage['$group']['_id']
+                if group_by.startswith('$'):
+                    group_by = group_by.replace('$', '')
+                    for doc in results:
+                        field_parts = group_by.split('.')
+                        value = doc
+                        for part in field_parts:
+                            value = value.get(part)
+                        if value not in grouped:
+                            grouped[value] = {'_id': value}
+                results = list(grouped.values())
+            elif '$sort' in stage:
+                # Simple sort by _id
+                results = sorted(results, key=lambda x: x.get('_id', ''))
+        return results
+    
+    def _matches_query(self, doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
+        """Check if document matches query"""
+        if not query:
+            return True
+        
+        for key, value in query.items():
+            if key == '_id':
+                if str(doc.get('_id')) != str(value):
+                    return False
+            elif '.' in key:
+                # Nested field query
+                parts = key.split('.')
+                doc_value = doc
+                for part in parts:
+                    if isinstance(doc_value, dict):
+                        doc_value = doc_value.get(part)
+                    else:
+                        return False
+                
+                if isinstance(value, dict):
+                    if '$in' in value:
+                        if not isinstance(doc_value, list):
+                            return False
+                        if not any(item in value['$in'] for item in doc_value):
+                            return False
+                    elif '$gte' in value:
+                        if doc_value is None:
+                            return False
+                        if doc_value < value['$gte']:
+                            return False
+                    elif '$lte' in value:
+                        if doc_value is None:
+                            return False
+                        if doc_value > value['$lte']:
+                            return False
+                else:
+                    if doc_value != value:
+                        return False
+            else:
+                if key not in doc or doc[key] != value:
+                    return False
+        
+        return True
+
+
+# Create in-memory collections
+activities_collection = InMemoryCollection()
+teachers_collection = InMemoryCollection()
 
 # Methods
 
